@@ -391,19 +391,14 @@ except Exception as exc:
     )
     st.stop()
 
-filtered_count = sum(1 for block in audit.rejected if block.use_snapshot)
-for uploaded in operations_files:
-    rows = len(operations_by_file.get(uploaded.name, []))
-    blocks = rows // 2
-    st.info(
-        f"Журнал 1С «{uploaded.name}»: из UTF-8 txt найдено **{blocks}** "
-        f"проведённых операций (события «Данные. Проведение»)."
-    )
-if filtered_count:
-    st.info(
-        f"В лист «Не принятые» попало **{filtered_count}** отфильтрованных "
-        f"записей журнала (Добавление, отмены, без даты и др.)."
-    )
+accepted_count = len(audit.accepted)
+rejected_count = len(audit.rejected)
+total_count = accepted_count + rejected_count
+st.info(
+    f"Всего операций: {total_count}  \n"
+    f"Отфильтровано в не принятые: {rejected_count}  \n"
+    f"Принятые операции: {accepted_count}"
+)
 
 with st.expander("Просмотр загруженных данных", expanded=False):
     tab1, *operation_tabs = st.tabs(
