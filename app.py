@@ -19,8 +19,6 @@ from processor import (
     process_operations,
 )
 
-PREVIEW_ROWS = 200
-
 st.set_page_config(
     page_title="Анализ проведённых операций ККУ",
     page_icon="📋",
@@ -214,33 +212,10 @@ rejected_count = sum(len(df) for df in filtered_by_file.values()) + len(
 )
 total_count = accepted_count + rejected_count
 st.info(
-    f"Всего операций: {total_count}  \n"
-    f"Отфильтровано в не принятые: {rejected_count}  \n"
-    f"Принятые операции: {accepted_count}"
+    f"Всего операций: {total_count:,}  \n"
+    f"Отфильтровано в непринятые: {rejected_count:,}  \n"
+    f"Принятые операции: {accepted_count:,}".replace(",", " ")
 )
-
-with st.expander("Просмотр загруженных данных", expanded=False):
-    tab1, *operation_tabs = st.tabs(
-        ["Справочник"] + [f"Операции: {name}" for name in operations_by_file]
-    )
-    with tab1:
-        directory_preview = pd.read_excel(io.BytesIO(directory_bytes), sheet_name=0)
-        st.dataframe(directory_preview, use_container_width=True, hide_index=True)
-    for tab, (name, operations_df) in zip(operation_tabs, operations_by_file.items()):
-        with tab:
-            total_rows = len(operations_df)
-            if total_rows > PREVIEW_ROWS:
-                st.caption(
-                    f"Показаны первые {PREVIEW_ROWS} из {total_rows} строк "
-                    "(полный файл не выводится, чтобы не нагружать память)."
-                )
-                st.dataframe(
-                    operations_df.head(PREVIEW_ROWS),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.dataframe(operations_df, use_container_width=True, hide_index=True)
 
 for warning in warnings:
     st.warning(warning)

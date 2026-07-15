@@ -18,6 +18,21 @@ from processor import (
 )
 
 
+def _autofit_xlsxwriter_columns(
+    worksheet,
+    dataframe: pd.DataFrame,
+    max_width: int = 60,
+) -> None:
+    """Подбирает ширину столбцов по заголовку и содержимому."""
+    for col_idx, column_name in enumerate(dataframe.columns):
+        max_length = len(str(column_name))
+        for value in dataframe.iloc[:, col_idx]:
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                continue
+            max_length = max(max_length, len(str(value)))
+        worksheet.set_column(col_idx, col_idx, min(max_length + 2, max_width))
+
+
 def build_report_excel(results: list[PersonResult]) -> bytes:
     """Формирует Excel-отчёт: ФИО, операция, количество."""
     rows = [
@@ -26,11 +41,12 @@ def build_report_excel(results: list[PersonResult]) -> bytes:
         if person.total > 0
         for name, count in person.operations.most_common()
     ]
+    dataframe = pd.DataFrame(rows)
     buffer = io.BytesIO()
+    sheet_name = "Проведённые операции"
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        pd.DataFrame(rows).to_excel(
-            writer, index=False, sheet_name="Проведённые операции"
-        )
+        dataframe.to_excel(writer, index=False, sheet_name=sheet_name)
+        _autofit_xlsxwriter_columns(writer.sheets[sheet_name], dataframe)
     return buffer.getvalue()
 
 
