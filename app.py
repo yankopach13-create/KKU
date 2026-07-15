@@ -20,6 +20,13 @@ from processor import (
     process_operations,
 )
 
+
+def _attach_source_file(blocks: list[AuditBlock], source_file: str) -> list[AuditBlock]:
+    """Проставляет имя файла в блоки аудита журнала."""
+    for block in blocks:
+        block.source_file = source_file
+    return blocks
+
 st.set_page_config(
     page_title="Анализ проведённых операций ККУ",
     page_icon="📋",
@@ -120,9 +127,11 @@ def read_directory(uploaded) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(uploaded.getvalue()), sheet_name=0)
 
 
-def read_operations_journal(uploaded) -> pd.DataFrame:
-    """Читает журнал 1С (UTF-8 txt) и преобразует в таблицу операций."""
-    return parse_1c_journal_bytes(uploaded.getvalue())
+def read_operations_journal(uploaded) -> tuple[pd.DataFrame, list[AuditBlock]]:
+    """Читает журнал 1С (UTF-8 txt): таблица операций + отфильтрованные блоки."""
+    parsed = parse_1c_journal_bytes(uploaded.getvalue())
+    filtered = _attach_source_file(parsed.filtered, uploaded.name)
+    return parsed.operations, filtered
 
 
 def process_all_operations(
@@ -137,7 +146,7 @@ def process_all_operations(
     operations_by_file: dict[str, pd.DataFrame] = {}
 
     for uploaded in uploaded_files:
-        operations_df = read_operations_journal(uploaded)
+        operations_df, filtered_blocks = read_operations_journal(uploaded)
         operations_by_file[uploaded.name] = operations_df
         file_results, file_warnings, file_audit = process_operations(
             directory_df,
@@ -146,8 +155,13 @@ def process_all_operations(
         )
         merge_person_results(merged_results, file_results)
         audit.accepted.extend(file_audit.accepted)
+        # Сначала отфильтрованное парсером, затем отклонения processor.
+        audit.rejected.extend(filtered_blocks)
         audit.rejected.extend(file_audit.rejected)
         warnings.extend(file_warnings)
+
+    for index, block in enumerate(audit.rejected, start=1):
+        block.block_no = index
 
     results = [merged_results[fio] for fio in fio_list if fio in merged_results]
     return results, warnings, audit, operations_by_file
@@ -199,6 +213,29 @@ def _source_row_dict(
     }
 
 
+def _snapshot_row_dict(
+    block: AuditBlock,
+    *,
+    is_confirmation: bool,
+) -> dict[str, str | int]:
+    """Строка аудита из снимка отфильтрованного блока журнала."""
+    if is_confirmation:
+        return {
+            "Файл": block.source_file,
+            "Строка Excel": block.confirmation_excel_row or "",
+            COL_APP: "",
+            COL_STATUS: "",
+            COL_PRESENTATION: block.snap_conf_present,
+        }
+    return {
+        "Файл": block.source_file,
+        "Строка Excel": block.operation_excel_row,
+        COL_APP: block.snap_app,
+        COL_STATUS: block.snap_status,
+        COL_PRESENTATION: block.snap_present,
+    }
+
+
 def _blocks_to_audit_rows(
     blocks: list[AuditBlock],
     operations_by_file: dict[str, pd.DataFrame],
@@ -209,16 +246,50 @@ def _blocks_to_audit_rows(
     """Три строки на блок: операция, подтверждение, причина."""
     rows: list[dict[str, str | int]] = []
     for block in blocks:
-        source_df = operations_by_file[block.source_file]
-        operation = _source_row_dict(
-            source_df,
-            block.operation_row_idx,
-            col_app,
-            col_status,
-            col_present,
-            excel_row=block.operation_excel_row,
-        )
-        operation["Файл"] = block.source_file
+        if block.use_snapshot:
+            operation = _snapshot_row_dict(block, is_confirmation=False)
+            has_confirmation = bool(block.snap_conf_present)
+            confirmation = (
+                _snapshot_row_dict(block, is_confirmation=True)
+                if has_confirmation
+                else {
+                    "Файл": block.source_file,
+                    "Строка Excel": "",
+                    COL_APP: "",
+                    COL_STATUS: "",
+                    COL_PRESENTATION: "",
+                }
+            )
+        else:
+            source_df = operations_by_file[block.source_file]
+            operation = _source_row_dict(
+                source_df,
+                block.operation_row_idx,
+                col_app,
+                col_status,
+                col_present,
+                excel_row=block.operation_excel_row,
+            )
+            operation["Файл"] = block.source_file
+            if block.confirmation_row_idx is not None:
+                confirmation = _source_row_dict(
+                    source_df,
+                    block.confirmation_row_idx,
+                    col_app,
+                    col_status,
+                    col_present,
+                    excel_row=block.confirmation_excel_row or 0,
+                )
+                confirmation["Файл"] = block.source_file
+            else:
+                confirmation = {
+                    "Файл": block.source_file,
+                    "Строка Excel": "",
+                    COL_APP: "",
+                    COL_STATUS: "",
+                    COL_PRESENTATION: "",
+                }
+
         rows.append(
             {
                 "ФИО": block.fio,
@@ -227,26 +298,6 @@ def _blocks_to_audit_rows(
                 "Причина": "",
             }
         )
-
-        if block.confirmation_row_idx is not None:
-            confirmation = _source_row_dict(
-                source_df,
-                block.confirmation_row_idx,
-                col_app,
-                col_status,
-                col_present,
-                excel_row=block.confirmation_excel_row or 0,
-            )
-            confirmation["Файл"] = block.source_file
-        else:
-            confirmation = {
-                "Файл": block.source_file,
-                "Строка Excel": "",
-                COL_APP: "",
-                COL_STATUS: "",
-                COL_PRESENTATION: "",
-            }
-
         rows.append(
             {
                 "ФИО": block.fio,
@@ -255,7 +306,6 @@ def _blocks_to_audit_rows(
                 "Причина": "",
             }
         )
-
         rows.append(
             {
                 "ФИО": block.fio,
@@ -341,12 +391,18 @@ except Exception as exc:
     )
     st.stop()
 
+filtered_count = sum(1 for block in audit.rejected if block.use_snapshot)
 for uploaded in operations_files:
     rows = len(operations_by_file.get(uploaded.name, []))
     blocks = rows // 2
     st.info(
         f"Журнал 1С «{uploaded.name}»: из UTF-8 txt найдено **{blocks}** "
-        f"проведённых операций (события «Данные. Проведение», без дублей «Добавление»)."
+        f"проведённых операций (события «Данные. Проведение»)."
+    )
+if filtered_count:
+    st.info(
+        f"В лист «Не принятые» попало **{filtered_count}** отфильтрованных "
+        f"записей журнала (Добавление, отмены, без даты и др.)."
     )
 
 with st.expander("Просмотр загруженных данных", expanded=False):

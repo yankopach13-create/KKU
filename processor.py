@@ -25,11 +25,17 @@ class AuditBlock:
     fio: str
     block_no: int
     reason: str
-    operation_row_idx: int
+    operation_row_idx: int = -1
     confirmation_row_idx: int | None = None
     source_file: str = ""
     operation_excel_row: int = 0
     confirmation_excel_row: int | None = None
+    # Снимок строк для отфильтрованных блоков журнала (не из таблицы операций).
+    use_snapshot: bool = False
+    snap_app: str = ""
+    snap_status: str = ""
+    snap_present: str = ""
+    snap_conf_present: str = ""
 
 
 @dataclass
