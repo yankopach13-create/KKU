@@ -1,31 +1,25 @@
 """Streamlit-приложение: справочник ФИО и анализ проведённых операций."""
 
+from __future__ import annotations
+
+import gc
 import io
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from audit_export import build_audit_excel, build_report_excel
 from journal_parser import parse_1c_journal_bytes
 from processor import (
-    COL_APP,
-    COL_PRESENTATION,
-    COL_STATUS,
     AuditBlock,
-    AuditData,
     PersonResult,
-    _cell_display,
-    _find_column,
     load_fio_list,
     merge_person_results,
     process_operations,
 )
 
-
-def _attach_source_file(blocks: list[AuditBlock], source_file: str) -> list[AuditBlock]:
-    """Проставляет имя файла в блоки аудита журнала."""
-    for block in blocks:
-        block.source_file = source_file
-    return blocks
+PREVIEW_ROWS = 200
 
 st.set_page_config(
     page_title="Анализ проведённых операций ККУ",
@@ -122,268 +116,91 @@ if directory_file is None or not operations_files:
     st.stop()
 
 
-def read_directory(uploaded) -> pd.DataFrame:
-    """Читает справочник ФИО из xlsx."""
-    return pd.read_excel(io.BytesIO(uploaded.getvalue()), sheet_name=0)
-
-
-def read_operations_journal(uploaded) -> tuple[pd.DataFrame, list[AuditBlock]]:
-    """Читает журнал 1С (UTF-8 txt): таблица операций + отфильтрованные блоки."""
-    parsed = parse_1c_journal_bytes(uploaded.getvalue())
-    filtered = _attach_source_file(parsed.filtered, uploaded.name)
-    return parsed.operations, filtered
-
-
-def process_all_operations(
-    directory_df: pd.DataFrame,
-    uploaded_files: list,
-) -> tuple[list[PersonResult], list[str], AuditData, dict[str, pd.DataFrame]]:
-    """Обрабатывает один или два файла операций и объединяет результат."""
+@st.cache_data(show_spinner="Файлы обрабатываются…", max_entries=3)
+def cached_process_all(
+    directory_bytes: bytes,
+    operations_payload: tuple[tuple[str, bytes], ...],
+) -> tuple[
+    list[dict[str, Any]],
+    list[str],
+    list[AuditBlock],
+    list[AuditBlock],
+    dict[str, pd.DataFrame],
+    dict[str, pd.DataFrame],
+]:
+    """Кеширует тяжёлую обработку по содержимому файлов."""
+    directory_df = pd.read_excel(io.BytesIO(directory_bytes), sheet_name=0)
     fio_list = load_fio_list(directory_df)
     merged_results = {fio: PersonResult(fio=fio) for fio in fio_list}
-    audit = AuditData()
     warnings: list[str] = []
     operations_by_file: dict[str, pd.DataFrame] = {}
+    filtered_by_file: dict[str, pd.DataFrame] = {}
+    accepted: list[AuditBlock] = []
+    processor_rejected: list[AuditBlock] = []
 
-    for uploaded in uploaded_files:
-        operations_df, filtered_blocks = read_operations_journal(uploaded)
-        operations_by_file[uploaded.name] = operations_df
+    for file_name, raw in operations_payload:
+        parsed = parse_1c_journal_bytes(raw)
+        operations_by_file[file_name] = parsed.operations
+        filtered = parsed.filtered.copy()
+        if not filtered.empty:
+            filtered["source_file"] = file_name
+        filtered_by_file[file_name] = filtered
+
         file_results, file_warnings, file_audit = process_operations(
             directory_df,
-            operations_df,
-            source_file=uploaded.name,
+            parsed.operations,
+            source_file=file_name,
         )
         merge_person_results(merged_results, file_results)
-        audit.accepted.extend(file_audit.accepted)
-        # Сначала отфильтрованное парсером, затем отклонения processor.
-        audit.rejected.extend(filtered_blocks)
-        audit.rejected.extend(file_audit.rejected)
+        accepted.extend(file_audit.accepted)
+        processor_rejected.extend(file_audit.rejected)
         warnings.extend(file_warnings)
-
-    for index, block in enumerate(audit.rejected, start=1):
-        block.block_no = index
+        del parsed
 
     results = [merged_results[fio] for fio in fio_list if fio in merged_results]
-    return results, warnings, audit, operations_by_file
-
-
-def _autofit_worksheet_columns(worksheet, max_width: int = 60) -> None:
-    """Подбирает ширину столбцов по содержимому."""
-    for column_cells in worksheet.columns:
-        column_letter = column_cells[0].column_letter
-        max_length = 0
-        for cell in column_cells:
-            if cell.value is None:
-                continue
-            max_length = max(max_length, len(str(cell.value)))
-        worksheet.column_dimensions[column_letter].width = min(max_length + 2, max_width)
-
-
-def build_report_excel(results: list[PersonResult]) -> bytes:
-    """Формирует Excel-отчёт: ФИО, операция, количество."""
-    rows = [
-        {"ФИО": person.fio, "Операция": name, "Количество": count}
-        for person in results
-        if person.total > 0
-        for name, count in person.operations.most_common()
-    ]
-    buffer = io.BytesIO()
-    sheet_name = "Проведённые операции"
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name=sheet_name)
-        _autofit_worksheet_columns(writer.sheets[sheet_name])
-    return buffer.getvalue()
-
-
-def _source_row_dict(
-    operations_df: pd.DataFrame,
-    row_idx: int,
-    col_app: str,
-    col_status: str,
-    col_present: str,
-    excel_row: int | None = None,
-) -> dict[str, str | int]:
-    row = operations_df.iloc[row_idx]
-    return {
-        "Файл": "",
-        "Строка Excel": excel_row if excel_row is not None else row_idx + 2,
-        COL_APP: _cell_display(row[col_app]),
-        COL_STATUS: _cell_display(row[col_status]),
-        COL_PRESENTATION: _cell_display(row[col_present]),
-    }
-
-
-def _snapshot_row_dict(
-    block: AuditBlock,
-    *,
-    is_confirmation: bool,
-) -> dict[str, str | int]:
-    """Строка аудита из снимка отфильтрованного блока журнала."""
-    if is_confirmation:
-        return {
-            "Файл": block.source_file,
-            "Строка Excel": block.confirmation_excel_row or "",
-            COL_APP: "",
-            COL_STATUS: "",
-            COL_PRESENTATION: block.snap_conf_present,
+    results_payload = [
+        {
+            "fio": person.fio,
+            "operations": dict(person.operations),
+            "total": person.total,
         }
-    return {
-        "Файл": block.source_file,
-        "Строка Excel": block.operation_excel_row,
-        COL_APP: block.snap_app,
-        COL_STATUS: block.snap_status,
-        COL_PRESENTATION: block.snap_present,
-    }
+        for person in results
+    ]
+    gc.collect()
+    return (
+        results_payload,
+        warnings,
+        accepted,
+        processor_rejected,
+        operations_by_file,
+        filtered_by_file,
+    )
 
 
-def _blocks_to_audit_rows(
-    blocks: list[AuditBlock],
-    operations_by_file: dict[str, pd.DataFrame],
-    col_app: str,
-    col_status: str,
-    col_present: str,
-) -> list[dict[str, str | int]]:
-    """Три строки на блок: операция, подтверждение, причина."""
-    rows: list[dict[str, str | int]] = []
-    for block in blocks:
-        if block.use_snapshot:
-            operation = _snapshot_row_dict(block, is_confirmation=False)
-            has_confirmation = bool(block.snap_conf_present)
-            confirmation = (
-                _snapshot_row_dict(block, is_confirmation=True)
-                if has_confirmation
-                else {
-                    "Файл": block.source_file,
-                    "Строка Excel": "",
-                    COL_APP: "",
-                    COL_STATUS: "",
-                    COL_PRESENTATION: "",
-                }
-            )
-        else:
-            source_df = operations_by_file[block.source_file]
-            operation = _source_row_dict(
-                source_df,
-                block.operation_row_idx,
-                col_app,
-                col_status,
-                col_present,
-                excel_row=block.operation_excel_row,
-            )
-            operation["Файл"] = block.source_file
-            if block.confirmation_row_idx is not None:
-                confirmation = _source_row_dict(
-                    source_df,
-                    block.confirmation_row_idx,
-                    col_app,
-                    col_status,
-                    col_present,
-                    excel_row=block.confirmation_excel_row or 0,
-                )
-                confirmation["Файл"] = block.source_file
-            else:
-                confirmation = {
-                    "Файл": block.source_file,
-                    "Строка Excel": "",
-                    COL_APP: "",
-                    COL_STATUS: "",
-                    COL_PRESENTATION: "",
-                }
-
-        rows.append(
-            {
-                "ФИО": block.fio,
-                "№ блока": block.block_no,
-                **operation,
-                "Причина": "",
-            }
-        )
-        rows.append(
-            {
-                "ФИО": block.fio,
-                "№ блока": block.block_no,
-                **confirmation,
-                "Причина": "",
-            }
-        )
-        rows.append(
-            {
-                "ФИО": block.fio,
-                "№ блока": block.block_no,
-                "Файл": block.source_file,
-                "Строка Excel": "",
-                COL_APP: "",
-                COL_STATUS: "",
-                COL_PRESENTATION: "",
-                "Причина": block.reason,
-            }
-        )
-
-    return rows
+def _results_from_payload(payload: list[dict[str, Any]]) -> list[PersonResult]:
+    results: list[PersonResult] = []
+    for item in payload:
+        person = PersonResult(fio=item["fio"])
+        person.operations.update(item["operations"])
+        results.append(person)
+    return results
 
 
-def _merge_fio_and_block_columns(worksheet, block_count: int) -> None:
-    """Объединяет ФИО и № блока для каждой тройки строк."""
-    row_start = 2
-    for _ in range(block_count):
-        row_end = row_start + 2
-        worksheet.merge_cells(
-            start_row=row_start,
-            start_column=1,
-            end_row=row_end,
-            end_column=1,
-        )
-        worksheet.merge_cells(
-            start_row=row_start,
-            start_column=2,
-            end_row=row_end,
-            end_column=2,
-        )
-        row_start = row_end + 1
-
-
-def build_audit_excel(
-    audit: AuditData,
-    operations_by_file: dict[str, pd.DataFrame],
-) -> bytes:
-    """Формирует Excel-аудит: 3 строки на блок, листы «Принятые» и «Не принятые»."""
-    sample_df = next(iter(operations_by_file.values()))
-    col_app = _find_column(sample_df.columns, COL_APP)
-    col_status = _find_column(sample_df.columns, COL_STATUS)
-    col_present = _find_column(sample_df.columns, COL_PRESENTATION)
-    if not col_app or not col_status or not col_present:
-        buffer = io.BytesIO()
-        pd.DataFrame().to_excel(buffer, index=False)
-        return buffer.getvalue()
-
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for sheet_name, blocks in (
-            ("Принятые", audit.accepted),
-            ("Не принятые", audit.rejected),
-        ):
-            sheet_rows = _blocks_to_audit_rows(
-                blocks, operations_by_file, col_app, col_status, col_present
-            )
-            pd.DataFrame(sheet_rows).to_excel(
-                writer,
-                index=False,
-                sheet_name=sheet_name,
-            )
-            if blocks:
-                _merge_fio_and_block_columns(writer.sheets[sheet_name], len(blocks))
-            _autofit_worksheet_columns(writer.sheets[sheet_name])
-
-    return buffer.getvalue()
-
+directory_bytes = directory_file.getvalue()
+operations_payload = tuple(
+    (uploaded.name, uploaded.getvalue()) for uploaded in operations_files
+)
 
 try:
-    with st.spinner("Файлы обрабатываются"):
-        directory_df = read_directory(directory_file)
-        results, warnings, audit, operations_by_file = process_all_operations(
-            directory_df,
-            operations_files,
-        )
+    (
+        results_payload,
+        warnings,
+        accepted_blocks,
+        processor_rejected,
+        operations_by_file,
+        filtered_by_file,
+    ) = cached_process_all(directory_bytes, operations_payload)
+    results = _results_from_payload(results_payload)
 except Exception as exc:
     st.error(
         "Не удалось прочитать файл. Справочник — xlsx, операции — журнал 1С в UTF-8 (txt). "
@@ -391,8 +208,10 @@ except Exception as exc:
     )
     st.stop()
 
-accepted_count = len(audit.accepted)
-rejected_count = len(audit.rejected)
+accepted_count = len(accepted_blocks)
+rejected_count = sum(len(df) for df in filtered_by_file.values()) + len(
+    processor_rejected
+)
 total_count = accepted_count + rejected_count
 st.info(
     f"Всего операций: {total_count}  \n"
@@ -405,10 +224,23 @@ with st.expander("Просмотр загруженных данных", expande
         ["Справочник"] + [f"Операции: {name}" for name in operations_by_file]
     )
     with tab1:
-        st.dataframe(directory_df, use_container_width=True, hide_index=True)
+        directory_preview = pd.read_excel(io.BytesIO(directory_bytes), sheet_name=0)
+        st.dataframe(directory_preview, use_container_width=True, hide_index=True)
     for tab, (name, operations_df) in zip(operation_tabs, operations_by_file.items()):
         with tab:
-            st.dataframe(operations_df, use_container_width=True, hide_index=True)
+            total_rows = len(operations_df)
+            if total_rows > PREVIEW_ROWS:
+                st.caption(
+                    f"Показаны первые {PREVIEW_ROWS} из {total_rows} строк "
+                    "(полный файл не выводится, чтобы не нагружать память)."
+                )
+                st.dataframe(
+                    operations_df.head(PREVIEW_ROWS),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.dataframe(operations_df, use_container_width=True, hide_index=True)
 
 for warning in warnings:
     st.warning(warning)
@@ -434,6 +266,14 @@ if not has_any_operations:
     st.info("Проведённые операции не найдены ни для одного ФИО из справочника.")
     st.stop()
 
+payload_key = (
+    hash(directory_bytes),
+    tuple((name, len(raw), hash(raw[:4096])) for name, raw in operations_payload),
+)
+if st.session_state.get("audit_payload_key") != payload_key:
+    st.session_state.pop("audit_excel_bytes", None)
+    st.session_state["audit_payload_key"] = payload_key
+
 with download_col:
     st.download_button(
         label="Скачать отчёт Excel",
@@ -444,13 +284,27 @@ with download_col:
     )
 
 with audit_col:
-    st.download_button(
-        label="Скачать проверку",
-        data=build_audit_excel(audit, operations_by_file),
-        file_name="проверка_кку.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    if st.button("Подготовить проверку", use_container_width=True):
+        with st.spinner("Формирование файла проверки…"):
+            st.session_state["audit_excel_bytes"] = build_audit_excel(
+                accepted_blocks,
+                processor_rejected,
+                filtered_by_file,
+                operations_by_file,
+            )
+            gc.collect()
+
+    audit_bytes = st.session_state.get("audit_excel_bytes")
+    if audit_bytes:
+        st.download_button(
+            label="Скачать проверку",
+            data=audit_bytes,
+            file_name="проверка_кку.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    else:
+        st.caption("Сначала нажмите «Подготовить проверку».")
 
 for person in results:
     if person.total == 0:

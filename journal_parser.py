@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
 
@@ -13,7 +13,6 @@ from processor import (
     COL_PRESENTATION,
     COL_STATUS,
     DOCUMENT_DATE_PATTERN,
-    AuditBlock,
 )
 
 BLOCK_START = re.compile(r"^\d{2}\.\d{2}\.\d{4}\s+\d{1,2}:\d{2}:\d{2}\t")
@@ -21,13 +20,23 @@ EVENT_POSTING = "Данные. Проведение"
 STATUS_FIXED = "зафиксирована"
 TRANSACTION_ID = re.compile(r"\((\d+)\)\s*$")
 
+FILTERED_COLUMNS = [
+    "fio",
+    "reason",
+    "snap_app",
+    "snap_status",
+    "snap_present",
+    "snap_conf_present",
+    "line_no",
+]
+
 
 @dataclass
 class JournalParseResult:
     """Таблица для подсчёта + отфильтрованные блоки для аудита."""
 
     operations: pd.DataFrame
-    filtered: list[AuditBlock]
+    filtered: pd.DataFrame
 
 
 def _last_filled(parts: list[str]) -> str:
@@ -86,30 +95,6 @@ def _extract_presentation(block_lines: list[str]) -> str:
         if candidate and DOCUMENT_DATE_PATTERN.search(candidate):
             return candidate
     return ""
-
-
-def _make_filtered_block(
-    *,
-    user: str,
-    status: str,
-    metadata: str,
-    presentation: str,
-    reason: str,
-    line_no: int,
-    block_no: int,
-) -> AuditBlock:
-    return AuditBlock(
-        fio=user or "(без пользователя)",
-        block_no=block_no,
-        reason=reason,
-        operation_excel_row=line_no,
-        confirmation_excel_row=line_no + 1 if presentation else None,
-        use_snapshot=True,
-        snap_app=user,
-        snap_status=status,
-        snap_present=metadata,
-        snap_conf_present=presentation,
-    )
 
 
 def _inspect_block(
@@ -204,14 +189,8 @@ def _inspect_block(
     return user, status, metadata, presentation, None
 
 
-def parse_1c_journal_text(text: str) -> JournalParseResult:
-    """
-    Преобразует журнал 1С (UTF-8 txt) в таблицу для processor.py.
-
-    Принятые блоки «Данные. Проведение» → 2 строки таблицы.
-    Отфильтрованные блоки → список AuditBlock для листа «Не принятые».
-    """
-    blocks: list[tuple[int, list[str]]] = []
+def _iter_blocks(text: str) -> Iterator[tuple[int, list[str]]]:
+    """Потоково отдаёт блоки журнала без хранения всего файла как списка блоков."""
     current: list[str] = []
     current_line_no = 0
 
@@ -219,37 +198,47 @@ def parse_1c_journal_text(text: str) -> JournalParseResult:
         line = raw_line.rstrip("\r")
         if BLOCK_START.match(line):
             if current:
-                blocks.append((current_line_no, current))
+                yield current_line_no, current
             current = [line]
             current_line_no = line_no
         elif current:
-            current.append(line)
+            # Обычно блок 1С = 3 строки; ограничиваем рост при битых данных.
+            if len(current) < 8:
+                current.append(line)
 
     if current:
-        blocks.append((current_line_no, current))
+        yield current_line_no, current
 
-    rows: list[dict[str, str]] = []
-    filtered: list[AuditBlock] = []
+
+def parse_1c_journal_text(text: str) -> JournalParseResult:
+    """
+    Преобразует журнал 1С (UTF-8 txt) в таблицу для processor.py.
+
+    Принятые блоки «Данные. Проведение» → 2 строки таблицы.
+    Отфильтрованные блоки → компактный DataFrame для листа «Не принятые».
+    """
+    op_users: list[str] = []
+    op_statuses: list[str] = []
+    op_presents: list[str] = []
+
+    filtered_rows: list[tuple[str, str, str, str, str, str, int]] = []
     seen_transactions: set[str] = set()
-    filtered_no = 0
 
-    for line_no, block in blocks:
+    for line_no, block in _iter_blocks(text):
         user, status, metadata, presentation, reject_reason = _inspect_block(block)
 
         if reject_reason:
-            # Пропускаем совсем пустой служебный мусор без полезных полей.
             if reject_reason == "Служебная/пустая запись журнала":
                 continue
-            filtered_no += 1
-            filtered.append(
-                _make_filtered_block(
-                    user=user,
-                    status=status,
-                    metadata=metadata,
-                    presentation=presentation,
-                    reason=reject_reason,
-                    line_no=line_no,
-                    block_no=filtered_no,
+            filtered_rows.append(
+                (
+                    user or "(без пользователя)",
+                    reject_reason,
+                    user,
+                    status,
+                    metadata,
+                    presentation,
+                    line_no,
                 )
             )
             continue
@@ -257,39 +246,32 @@ def parse_1c_journal_text(text: str) -> JournalParseResult:
         transaction_id = _extract_transaction_id(block)
         if transaction_id:
             if transaction_id in seen_transactions:
-                filtered_no += 1
-                filtered.append(
-                    _make_filtered_block(
-                        user=user,
-                        status=status,
-                        metadata=metadata,
-                        presentation=presentation,
-                        reason=(
-                            f"Не принято: дубликат транзакции ({transaction_id})"
-                        ),
-                        line_no=line_no,
-                        block_no=filtered_no,
+                filtered_rows.append(
+                    (
+                        user or "(без пользователя)",
+                        f"Не принято: дубликат транзакции ({transaction_id})",
+                        user,
+                        status,
+                        metadata,
+                        presentation,
+                        line_no,
                     )
                 )
                 continue
             seen_transactions.add(transaction_id)
 
-        rows.append(
-            {
-                COL_APP: user,
-                COL_STATUS: status,
-                COL_PRESENTATION: metadata,
-            }
-        )
-        rows.append(
-            {
-                COL_APP: "",
-                COL_STATUS: "",
-                COL_PRESENTATION: presentation,
-            }
-        )
+        op_users.extend((user, ""))
+        op_statuses.extend((status, ""))
+        op_presents.extend((metadata, presentation))
 
-    operations = pd.DataFrame(rows, columns=[COL_APP, COL_STATUS, COL_PRESENTATION])
+    operations = pd.DataFrame(
+        {
+            COL_APP: op_users,
+            COL_STATUS: op_statuses,
+            COL_PRESENTATION: op_presents,
+        }
+    )
+    filtered = pd.DataFrame(filtered_rows, columns=FILTERED_COLUMNS)
     return JournalParseResult(operations=operations, filtered=filtered)
 
 

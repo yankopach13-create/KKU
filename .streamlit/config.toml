@@ -1,0 +1,11 @@
+[server]
+# Месячный журнал 1С может быть больше дефолтных 200 МБ.
+maxUploadSize = 400
+maxMessageSize = 400
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# Меньше лишних ререндеров при наборе/фокусе виджетов.
+fastReruns = true

@@ -298,27 +298,36 @@ def process_operations(
         )
         return [], warnings, audit
 
-    results: list[PersonResult] = []
+    persons = {fio: PersonResult(fio=fio) for fio in fio_list}
+    block_nos = {fio: 0 for fio in fio_list}
     total_rows = len(operations_df)
 
-    for fio in fio_list:
-        person = PersonResult(fio=fio)
-        block_no = 0
+    apps = operations_df[col_app].tolist()
+    statuses = operations_df[col_status].tolist()
+    presents = operations_df[col_present].tolist()
 
-        for row_idx in range(total_rows):
-            row = operations_df.iloc[row_idx]
+    for row_idx in range(total_rows):
+        app_value = apps[row_idx]
+        if not _is_filled(app_value):
+            continue
 
-            if not _fio_matches(row[col_app], fio):
-                continue
+        matched_fios = [fio for fio in fio_list if _fio_matches(app_value, fio)]
+        if not matched_fios:
+            continue
 
+        status_value = statuses[row_idx]
+        present_value = presents[row_idx]
+
+        for fio in matched_fios:
+            person = persons[fio]
             person.fio_rows += 1
 
-            if _is_cancelled_status(row[col_status]):
-                block_no += 1
+            if _is_cancelled_status(status_value):
+                block_nos[fio] += 1
                 _append_audit_block(
                     audit.rejected,
                     fio,
-                    block_no,
+                    block_nos[fio],
                     "Не принято: операция отменена",
                     row_idx,
                     None,
@@ -326,12 +335,12 @@ def process_operations(
                 )
                 continue
 
-            if not _is_fixed_status(row[col_status]):
-                block_no += 1
+            if not _is_fixed_status(status_value):
+                block_nos[fio] += 1
                 _append_audit_block(
                     audit.rejected,
                     fio,
-                    block_no,
+                    block_nos[fio],
                     "Не принято: ФИО без «Зафиксирована»",
                     row_idx,
                     None,
@@ -341,12 +350,12 @@ def process_operations(
 
             person.header_rows += 1
 
-            if not _is_filled(row[col_present]):
-                block_no += 1
+            if not _is_filled(present_value):
+                block_nos[fio] += 1
                 _append_audit_block(
                     audit.rejected,
                     fio,
-                    block_no,
+                    block_nos[fio],
                     "Не принято: «Зафиксирована» без названия операции",
                     row_idx,
                     None,
@@ -354,14 +363,14 @@ def process_operations(
                 )
                 continue
 
-            block_no += 1
-            operation_name = _normalize_text(row[col_present])
+            block_nos[fio] += 1
+            operation_name = _normalize_text(present_value)
 
             if row_idx + 1 >= total_rows:
                 _append_audit_block(
                     audit.rejected,
                     fio,
-                    block_no,
+                    block_nos[fio],
                     "Не принято: нет строки подтверждения ниже",
                     row_idx,
                     None,
@@ -369,7 +378,17 @@ def process_operations(
                 )
                 continue
 
-            next_row = operations_df.iloc[row_idx + 1]
+            # Для подтверждения достаточно значений следующего ряда.
+            next_app = apps[row_idx + 1]
+            next_status = statuses[row_idx + 1]
+            next_present = presents[row_idx + 1]
+            next_row = pd.Series(
+                {
+                    col_app: next_app,
+                    col_status: next_status,
+                    col_present: next_present,
+                }
+            )
             rejection_reason = _get_confirmation_rejection_reason(
                 next_row, col_app, col_status, col_present, fio, operation_name
             )
@@ -378,7 +397,7 @@ def process_operations(
                 _append_audit_block(
                     audit.rejected,
                     fio,
-                    block_no,
+                    block_nos[fio],
                     f"Не принято: {rejection_reason}",
                     row_idx,
                     row_idx + 1,
@@ -390,13 +409,12 @@ def process_operations(
             _append_audit_block(
                 audit.accepted,
                 fio,
-                block_no,
+                block_nos[fio],
                 "Принято",
                 row_idx,
                 row_idx + 1,
                 source_file,
             )
 
-        results.append(person)
-
+    results = [persons[fio] for fio in fio_list]
     return results, warnings, audit
